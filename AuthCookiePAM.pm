@@ -41,6 +41,7 @@ use Authen::PAM;
 use vars qw( @ISA );
 @ISA = qw( Apache::AuthCookie );
 
+use Data::Dumper;
 use Apache::File;
 use Digest::MD5 qw( md5_hex );
 use Date::Calc qw( Today_and_Now Add_Delta_DHMS );
@@ -406,12 +407,7 @@ sub authen_cred($$\@)
            $r->subprocess_env('AuthenReason', 'Account for $user is locked. Contact your Administrator.');
            return 'bad';
 	}
-	if ( $res == PAM_NEW_AUTHTOK_REQD() ) {
-           $r->log_error("ERROR: PAssword for $user expired. Change Password\n");
-           $r->subprocess_env('AuthenReason', 'Password Expired. Please Change your password.');
-	   return $r->auth_type->changepwd_form ($user);
-	}
-	if ( $res == PAM_SUCCESS() ) {
+	if ( $res == PAM_SUCCESS() || $res == PAM_NEW_AUTHTOK_REQD()) {
            # Create the expire time for the ticket.
            my $expire_time;
            # expire time in a zillion years if it's forever.
@@ -472,6 +468,11 @@ sub authen_cred($$\@)
 			"blowfish:$auth_name"
 		}->encrypt_hex( $session_key );
 	   }
+	   if ( $res == PAM_NEW_AUTHTOK_REQD() ) {
+              $r->subprocess_env("AuthenReason","Password Expired. Please Change your password.");
+              $r->subprocess_env("AuthenChangePwdUser",$user);
+              $r->subprocess_env("AuthenCode",PAM_NEW_AUTHTOK_REQD());
+	   }
 	   $pamh=0;
 	   undef $pamh;
 	   return $encrypted_session_key;
@@ -509,7 +510,6 @@ sub create_conv_func
           if ($state == 2) {
 	       $ans = $confpass ;
 	  }
-	  $r->log_error("VA: $msg $user $pass $newpass $confpass $state=$ans");
           $state++;
 	  }
           push @res, (PAM_SUCCESS(),$ans);
@@ -667,8 +667,7 @@ sub _convert_to_get
     
     while ( ($name, $value) = each %$args) {
       # we dont want to copy login data, only extra data
-      next if $name eq 'destination'
-           or $name =~ /^credential_\d+$/;
+      next if $name eq "destination" or $name =~ /^credential_\d+$/;
 
       $value = '' unless defined $value;
       push @pairs, escape_uri($name) . '=' . escape_uri($value);
@@ -678,6 +677,7 @@ sub _convert_to_get
     $r->method('GET');
     $r->method_number(M_GET);
     $r->headers_in->unset('Content-Length');
+
 }
 
 sub changepwd ($$) 
@@ -741,9 +741,9 @@ sub changepwd ($$)
 
   if ( $res == PAM_SUCCESS()) {
        $r->subprocess_env('AuthenReason', 'Password Updated. Please login with your new password');
-       $r->log_reason("AuthenCookiePAM:". $args{'destination'}."Password for $user Updated. Please login with your new password");
        # 
        $auth_type->logout($r);
+       $r->log_reason("AuthenCookiePAM:". $args{'destination'}."Password for $user Updated. Please login with your new password");
        $r->err_header_out("Location" => $args{'destination'});
        return REDIRECT;
   }
@@ -754,6 +754,57 @@ sub changepwd ($$)
     }
 }
 
+sub login ($$) {
+  my ($self, $r) = @_;
+  my $debug = $r->dir_config("AuthCookieDebug") || 0;
+
+  my ($auth_type, $auth_name) = ($r->auth_type, $r->auth_name);
+  my %args = $r->method eq 'POST' ? $r->content : $r->args;
+  $self->_convert_to_get($r, \%args) if $r->method eq 'POST';
+
+  unless (exists $args{'destination'}) {
+    $r->log_error("No key 'destination' found in form data");
+    $r->subprocess_env('AuthCookieReason', 'no_cookie');
+    return $auth_type->login_form;
+  }
+  
+  # Get the credentials from the data posted by the client
+  my @credentials;
+  while (exists $args{"credential_" . ($#credentials + 1)}) {
+    $r->log_error("credential_" . ($#credentials + 1) . " " .
+		  $args{"credential_" . ($#credentials + 1)}) if ($debug >= 2);
+    push(@credentials, $args{"credential_" . ($#credentials + 1)});
+  }
+  
+  # Exchange the credentials for a session key.
+  my $ses_key = $self->authen_cred($r, @credentials);
+  unless ($ses_key) {
+    $r->log_error("Bad credentials") if $debug >=2;
+    $r->subprocess_env('AuthCookieReason', 'bad_credentials');
+    $r->uri($args{'destination'});
+    return $auth_type->login_form;
+  }
+
+  if ($debug >= 2) {
+    if (defined $ses_key) {
+      $r->log_error("ses_key $ses_key");
+    }
+    else {
+      $r->log_error("ses_key undefined");
+    }
+  }
+
+  $self->send_cookie($ses_key);
+  $self->handle_cache;
+
+  if ($r->subprocess_env("AuthenCode") eq PAM_NEW_AUTHTOK_REQD()) { 
+     return $r->auth_type->changepwd_form ($r->subprocess_env("AuthenChangePwdUser"));
+  }
+
+  $r->header_out("Location" => $args{'destination'});
+
+  return REDIRECT;
+}
 #-------------------------------------------------------------------------------
 # Take a list of groups and make sure that the current remote user is a member
 # of one of them.
